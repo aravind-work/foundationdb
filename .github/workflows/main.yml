@@ -1,0 +1,74 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "master" branch
+  ## push:
+  ##  branches: [ "master" ]
+  ## pull_request:
+  ##  branches: [ "master" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: self-hosted
+    container: foundationdb/build:centos7-latest
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+        id: release-branch-checkout
+        with:
+          ref: release-7.1
+          # Include tags by using fetch-depth=0
+          # This is required to identify 'v?.??-adobe' tag
+          fetch-depth: 0
+          path: 'src/foundationdb'          
+                    
+      # Identify latest adobe tag
+      - name: Identify the latest adobe tag
+        id: identify-adobe-tag
+        run: |
+          cd src/foundationdb
+          git tag --sort=taggerdate | grep adobe | tail -1
+          echo "RELEASE_TAG=$(git tag --sort=taggerdate | grep adobe | tail -1)" >> $GITHUB_ENV
+          
+      # Run FDB build
+      - name: Run FDB build
+        id: build
+        run: |
+          mkdir -p build_output
+          source /opt/rh/devtoolset-8/enable && \
+            source /opt/rh/rh-python38/enable && \
+            source /opt/rh/rh-ruby27/enable && \
+            cmake -DFDB_RELEASE=ON \
+                  -DBUILD_AZURE_BACKUP=ON \
+                  -S src/foundationdb \
+                  -B build_output \
+                  -G Ninja 
+          ninja -j8 -C build_output 
+          cd build_output
+          cpack -G DEB
+          ls -laR packages
+          rm -rf packages/bin
+          rm -rf packages/*versioned*
+          rm -rf packages/*.tar.gz
+          # rm -rf packages/*ddeb*
+                    
+      - name: release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            build_output/packages/*.deb
+            build_output/packages/*.ddeb
+            build_output/packages/*.sha256
+            build_output/packages/*.jar
+
