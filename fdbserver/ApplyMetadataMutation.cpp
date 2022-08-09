@@ -20,6 +20,7 @@
 
 #include "fdbclient/BackupAgent.actor.h"
 #include "fdbclient/KeyBackedTypes.h" // for key backed map codecs for tss mapping
+#include "fdbclient/Metacluster.h"
 #include "fdbclient/MutationList.h"
 #include "fdbclient/Notified.h"
 #include "fdbclient/SystemData.h"
@@ -650,7 +651,7 @@ private:
 	}
 
 	void checkSetTenantMapPrefix(MutationRef m) {
-		KeyRef prefix = TenantMetadata::tenantMap.subspace.begin;
+		KeyRef prefix = TenantMetadata::tenantMap().subspace.begin;
 		if (m.param1.startsWith(prefix)) {
 			if (tenantMap) {
 				ASSERT(version != invalidVersion);
@@ -682,6 +683,26 @@ private:
 			}
 
 			CODE_PROBE(true, "Tenant added to map");
+		}
+	}
+
+	void checkSetMetaclusterRegistration(MutationRef m) {
+		if (m.param1 == MetaclusterMetadata::metaclusterRegistration().key) {
+			MetaclusterRegistrationEntry entry = MetaclusterRegistrationEntry::decode(m.param2);
+
+			TraceEvent("SetMetaclusterRegistration", dbgid)
+			    .detail("ClusterType", entry.clusterType)
+			    .detail("MetaclusterID", entry.metaclusterId)
+			    .detail("MetaclusterName", entry.metaclusterName)
+			    .detail("ClusterID", entry.id)
+			    .detail("ClusterName", entry.name);
+
+			if (!initialCommit) {
+				txnStateStore->set(KeyValueRef(m.param1, m.param2));
+			}
+
+			confChange = true;
+			CODE_PROBE(true, "Metacluster registration set");
 		}
 	}
 
@@ -1029,7 +1050,7 @@ private:
 	}
 
 	void checkClearTenantMapPrefix(KeyRangeRef range) {
-		KeyRangeRef subspace = TenantMetadata::tenantMap.subspace;
+		KeyRangeRef subspace = TenantMetadata::tenantMap().subspace;
 		if (subspace.intersects(range)) {
 			if (tenantMap) {
 				ASSERT(version != invalidVersion);
@@ -1071,6 +1092,19 @@ private:
 			}
 
 			CODE_PROBE(true, "Tenant cleared from map");
+		}
+	}
+
+	void checkClearMetaclusterRegistration(KeyRangeRef range) {
+		if (range.contains(MetaclusterMetadata::metaclusterRegistration().key)) {
+			TraceEvent("ClearMetaclusterRegistration", dbgid);
+
+			if (!initialCommit) {
+				txnStateStore->clear(singleKeyRange(MetaclusterMetadata::metaclusterRegistration().key));
+			}
+
+			confChange = true;
+			CODE_PROBE(true, "Metacluster registration cleared");
 		}
 	}
 
@@ -1196,6 +1230,7 @@ public:
 				checkSetMinRequiredCommitVersionKey(m);
 				checkSetVersionEpochKey(m);
 				checkSetTenantMapPrefix(m);
+				checkSetMetaclusterRegistration(m);
 				checkSetOtherKeys(m);
 			} else if (m.type == MutationRef::ClearRange && isSystemKey(m.param2)) {
 				KeyRangeRef range(m.param1, m.param2);
@@ -1213,6 +1248,7 @@ public:
 				checkClearTssQuarantineKeys(m, range);
 				checkClearVersionEpochKeys(m, range);
 				checkClearTenantMapPrefix(range);
+				checkClearMetaclusterRegistration(range);
 				checkClearMiscRangeKeys(range);
 			}
 		}
