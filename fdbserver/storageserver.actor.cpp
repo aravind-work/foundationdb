@@ -3435,6 +3435,9 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 	state double getValuesStart = g_network->timer();
 	getRange.begin = firstGreaterOrEqual(KeyRef(*a, prefix));
 	getRange.end = firstGreaterOrEqual(strinc(prefix, *a));
+	if (pOriginalReq->debugID.present())
+		g_traceBatch.addEvent(
+		    "TransactionDebug", pOriginalReq->debugID.get().first(), "storageserver.quickGetKeyValues.Before");
 	try {
 		// TODO: Use a lower level API may be better? Or tweak priorities?
 		GetKeyValuesRequest req;
@@ -3465,6 +3468,10 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 			getRange.result = RangeResultRef(reply.data, reply.more);
 			const double duration = g_network->timer() - getValuesStart;
 			data->counters.mappedRangeLocalSample.addMeasurement(duration);
+			if (pOriginalReq->debugID.present())
+				g_traceBatch.addEvent("TransactionDebug",
+				                      pOriginalReq->debugID.get().first(),
+				                      "storageserver.quickGetKeyValues.AfterLocalFetch");
 			return getRange;
 		}
 		// Otherwise fallback.
@@ -3476,6 +3483,9 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 	if (SERVER_KNOBS->QUICK_GET_KEY_VALUES_FALLBACK) {
 		state Transaction tr(data->cx, pOriginalReq->tenantInfo.name);
 		tr.setVersion(version);
+		if (pOriginalReq->debugID.present()) {
+			tr.debugTransaction(pOriginalReq->debugID.get());
+		}
 		// TODO: is DefaultPromiseEndpoint the best priority for this?
 		tr.trState->taskID = TaskPriority::DefaultPromiseEndpoint;
 		Future<RangeResult> rangeResultFuture =
@@ -3486,6 +3496,10 @@ ACTOR Future<GetRangeReqAndResultRef> quickGetKeyValues(
 		getRange.result = rangeResult;
 		const double duration = g_network->timer() - getValuesStart;
 		data->counters.mappedRangeRemoteSample.addMeasurement(duration);
+		if (pOriginalReq->debugID.present())
+			g_traceBatch.addEvent("TransactionDebug",
+			                      pOriginalReq->debugID.get().first(),
+			                      "storageserver.quickGetKeyValues.AfterRemoteFetch");
 		return getRange;
 	} else {
 		throw quick_get_key_values_miss();
@@ -3772,7 +3786,9 @@ ACTOR Future<GetMappedKeyValuesReply> mapKeyValues(StorageServer* data,
 	result.arena.dependsOn(input.arena);
 
 	result.data.reserve(result.arena, input.data.size());
-
+	if (pOriginalReq->debugID.present())
+		g_traceBatch.addEvent(
+		    "TransactionDebug", pOriginalReq->debugID.get().first(), "storageserver.mapKeyValues.Start");
 	state Tuple mappedKeyFormatTuple;
 	state Tuple mappedKeyTuple;
 
@@ -3791,6 +3807,9 @@ ACTOR Future<GetMappedKeyValuesReply> mapKeyValues(StorageServer* data,
 	state std::vector<MappedKeyValueRef> kvms(k);
 	state std::vector<Future<Void>> subqueries;
 	state int offset = 0;
+	if (pOriginalReq->debugID.present())
+		g_traceBatch.addEvent(
+		    "TransactionDebug", pOriginalReq->debugID.get().first(), "storageserver.mapKeyValues.BeforeLoop");
 	for (; offset < sz; offset += SERVER_KNOBS->MAX_PARALLEL_QUICK_GET_VALUE) {
 		// Divide into batches of MAX_PARALLEL_QUICK_GET_VALUE subqueries
 		for (int i = 0; i + offset < sz && i < SERVER_KNOBS->MAX_PARALLEL_QUICK_GET_VALUE; i++) {
@@ -3810,11 +3829,17 @@ ACTOR Future<GetMappedKeyValuesReply> mapKeyValues(StorageServer* data,
 			    mapSubquery(data, input.version, pOriginalReq, &result.arena, isRangeQuery, it, kvm, mappedKey));
 		}
 		wait(waitForAll(subqueries));
+		if (pOriginalReq->debugID.present())
+			g_traceBatch.addEvent(
+			    "TransactionDebug", pOriginalReq->debugID.get().first(), "storageserver.mapKeyValues.AfterBatch");
 		subqueries.clear();
 		for (int i = 0; i + offset < sz && i < SERVER_KNOBS->MAX_PARALLEL_QUICK_GET_VALUE; i++) {
 			result.data.push_back(result.arena, kvms[i]);
 		}
 	}
+	if (pOriginalReq->debugID.present())
+		g_traceBatch.addEvent(
+		    "TransactionDebug", pOriginalReq->debugID.get().first(), "storageserver.mapKeyValues.AfterAll");
 	return result;
 }
 
@@ -5728,11 +5753,30 @@ ACTOR Future<Void> fetchKeys(StorageServer* data, AddingShard* shard) {
 			// At iteration 1, dest SS selects GRV as fetchVersion and (suppose) can read the data from src SS.
 			// Then dest SS waits its version catch up with this GRV version and write the data to disk.
 			// Note that dest SS waits outside the fetchKeysParallelismLock.
+			fetchVersion = std::max(shard->fetchVersion, data->version.get());
+			if (g_network->isSimulated() && BUGGIFY_WITH_PROB(0.01)) {
+				// Test using GRV version for fetchKey.
+				lastError = transaction_too_old();
+			}
 			if (lastError.code() == error_code_transaction_too_old) {
-				Version grvVersion = wait(tr.getRawReadVersion());
-				fetchVersion = std::max(grvVersion, data->version.get());
-			} else {
-				fetchVersion = std::max(shard->fetchVersion, data->version.get());
+				try {
+					Version grvVersion = wait(tr.getRawReadVersion());
+					if (g_network->isSimulated() && BUGGIFY_WITH_PROB(0.01)) {
+						// Test failed GRV request.
+						throw proxy_memory_limit_exceeded();
+					}
+					fetchVersion = std::max(grvVersion, fetchVersion);
+				} catch (Error& e) {
+					if (e.code() == error_code_actor_cancelled) {
+						throw e;
+					}
+
+					// Note that error in getting GRV doesn't affect any storage server state. Therefore, we catch all
+					// errors here without failing the storage server. When error happens, fetchVersion fall back to
+					// the above computed fetchVersion.
+					TraceEvent(SevWarn, "FetchKeyGRVError", data->thisServerID).error(e);
+					lastError = e;
+				}
 			}
 			ASSERT(fetchVersion >= shard->fetchVersion); // at this point, shard->fetchVersion is the last fetchVersion
 			shard->fetchVersion = fetchVersion;
